@@ -18,3 +18,9 @@ venv/
 # Claves y entorno
 .env
 kaggle.json
+
+# Pesos de modelos y salidas de experimentos (pesados; los pesos FINALES se agregan con `git add -f` al entregar)
+models/*.pt
+models/*.pth
+*.ckpt
+train/runs/
