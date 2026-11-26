@@ -217,3 +217,56 @@ Pasan a la final los 6 a 8 equipos con más puntaje. La final tiene su propia r�
 - **Sobre la data, Kaggle o las reglas:** al grupo oficial de WhatsApp de participantes.
 - **Mentorías** (opcionales, 24 nov – 8 dic): la agenda está en el grupo; citas de 20–30 min, reservadas con 6 h de anticipación. Hay que llevar el nombre del equipo y una duda concreta.
 - **Organizador:** Daniel Malca · dsc.pucp@gmail.com
+
+---
+
+## 9. Experimentos del modelo (bitácora)
+
+Dos scripts en `train/` (requieren la data en `data/`; corren en ~3–7 min por modelo en una Mac M4 con `mps`, o en GPU):
+
+```bash
+# una corrida = un modelo; valida con las últimas 2 semanas de junio y anota en train/runs/log.jsonl
+.venv/bin/python train/exp.py --name prueba --base interp --lags -2 -1 0 1 2 --loss metric --epochs 15 --swa_from 8
+
+# score local del promedio de varias corridas, y submission de Kaggle
+.venv/bin/python train/ensemble.py val prueba otra_corrida
+.venv/bin/python train/ensemble.py train/runs/sub.csv corrida1 corrida2
+```
+
+Opciones de `exp.py`: `--base clim|interp` (sobre qué predice la red), `--lags` (horas del GFS relativas a t), `--loss mse|metric`, `--wd`, `--epochs`, `--seed`, `--swa_from N` (promedia los pesos desde la época N en vez de elegir la mejor época con val) y `--full` (entrena con todo el train, sin validación). Cada corrida guarda en `train/runs/<nombre>/` los pesos (`model.pt`, ~8 MB), `val_pred.npy` y `test_pred.npy`.
+
+> ⚠️ En zsh (Mac) no pases las opciones dentro de una variable (`$OPCIONES`): zsh no las separa y argparse falla. Escríbelas directo.
+
+### Resultados en validación local (mayor es mejor)
+
+| Modelo | Val | RMSE RH | T | U | V |
+|---|---|---|---|---|---|
+| Starter (CNN chica, base climatología) | 0.338 | 9.98 | 0.97 | 1.72 | 1.61 |
+| Regresión lineal por píxel (ridge) | 0.268 | 10.55 | 1.19 | 1.87 | 1.75 |
+| U-Net, base climatología | 0.338 | 9.16 | 1.05 | 1.72 | 1.62 |
+| U-Net, base **GFS interpolado + sesgo por hora** | 0.360 | 9.41 | 0.91 | 1.68 | 1.58 |
+| + horas futuras del GFS (t−2…t+2) | 0.363 | 8.82 | 0.93 | 1.72 | 1.58 |
+| 1 modelo honesto (pérdida = métrica, 15 épocas, SWA desde la 8) | 0.353–0.363 | ~9.6 | 0.90 | 1.69 | 1.58 |
+| **Ensamble de 5 semillas (honesto)** | **0.377** | 9.27 | 0.88 | 1.64 | 1.54 |
+
+"Honesto" = sin elegir la época mirando la validación; es el mismo procedimiento que usamos al entrenar con todo (`--full`). Los scores que eligen la mejor época salen ~0.01–0.02 más altos de lo real.
+
+### Lo que aprendimos
+
+- **Lo que más suma es promediar modelos** (semillas distintas): +0.02. El modelo tiene mucha varianza, sobre todo en el viento.
+- **Base = GFS interpolado + sesgo medio por (hora, píxel)** le gana a la climatología: el test es julio–agosto (otra temporada) y la climatología del train (feb–jun) se queda corta, sobre todo en humedad.
+- **El cuello de botella es el viento:** T y RH bajan a ~45–55 % del error de la climatología; U y V se quedan en ~73–79 %.
+- La U-Net sola (sin cambiar la base) no mejora al starter. La regresión lineal por píxel es peor en viento.
+- Entrenar 30 épocas sobreajusta (la mejor época suele ser la 12–15).
+- La validación local **no** es comparable 1 a 1 con el leaderboard: el starter da 0.338 local y 0.428 en el público.
+
+### Submission actual
+
+`train/runs/sub_full_swa5.csv` = promedio de `full_s0` … `full_s4` (5 semillas entrenadas con todo el train, misma configuración que el ensamble honesto). Pendiente: subirla a Kaggle cuando los 4 estemos en el equipo `BurrosMX`.
+
+### Ideas siguientes
+
+- Más contexto para el viento: encoder del GFS con más alcance o un vector global del campo de 17×13.
+- Validación cruzada temporal (varios cortes, no solo fines de junio) para decidir con menos ruido.
+- Más semillas / arquitecturas distintas en el ensamble (de 3 a 5 semillas ganó +0.006).
+- Ver cómo se correlaciona la validación local con el leaderboard público.
