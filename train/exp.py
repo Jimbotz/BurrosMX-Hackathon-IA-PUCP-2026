@@ -26,6 +26,10 @@ p.add_argument('--recent_rep', type=int, default=1, help='...esta cantidad de ve
 p.add_argument('--lags', type=int, nargs='+', default=[-2, -1, 0])     # horas GFS relativas a t
 p.add_argument('--feats', nargs='*', default=[], choices=['wind', 'vap', 'daily'], help='variables compuestas del GFS')
 p.add_argument('--static_plus', action='store_true', help='más relieve: TPI 3/21, pendiente, orientación')
+# el WRF se reinicia cada día a las 00 UTC desde el GFS (salto en Y a las 00 UTC, ver analysis/): la hora UTC es
+# el tiempo de pronóstico de esa corrida y el GFS de las 00 UTC del día es su condición inicial
+p.add_argument('--hour_onehot', action='store_true', help='hora UTC en one-hot (24) además de sin/cos')
+p.add_argument('--init', action='store_true', help='agrega el GFS de las 00 UTC del mismo día (condición inicial del WRF)')
 p.add_argument('--width', type=int, default=64)
 p.add_argument('--enc_blocks', type=int, default=1, help='bloques conv del encoder a 27 km')
 p.add_argument('--attn', action='store_true', help='transformer en el nivel más bajo de la U-Net (18x9)')
@@ -86,14 +90,20 @@ def coarse_feats(X, t):
     return np.concatenate(out, -1).astype(np.float32)
 
 
-def windows(X, t, lags):  # (n, L, 17, 13, C); si falta una hora, usa la hora t (como el starter)
+def windows(X, t, lags):  # (n, L[+1], 17, 13, C); si falta una hora, usa la hora t (como el starter)
     ts = pd.to_datetime(t, format='%Y%m%d%H'); pos = {k: i for i, k in enumerate(ts)}
-    idx = np.array([[pos.get(k + pd.Timedelta(hours=l), i) for l in lags] for i, k in enumerate(ts)])
-    return X[idx]
+    idx = [[pos.get(k + pd.Timedelta(hours=l), i) for l in lags] for i, k in enumerate(ts)]
+    if a.init:   # 00 UTC del mismo día; si falta, la primera hora disponible de ese día
+        first = {}
+        for i, k in enumerate(ts): first.setdefault(k.normalize(), i)
+        idx = [r + [pos.get(k.normalize(), first[k.normalize()])] for r, k in zip(idx, ts)]
+    return X[np.array(idx)]
 
 
 Ctr, Cte = coarse_feats(Xtr, ttr), coarse_feats(Xte, tte)
 NC = Ctr.shape[-1]
+NL = len(a.lags) + a.init          # horas del GFS que ve el modelo
+NH = 26 if a.hour_onehot else 2    # canales de hora
 
 # grilla WRF dentro de la grilla GFS, para grid_sample (igual que el starter)
 LAT, LON = np.meshgrid(st['wrf_lats'], st['wrf_lons'], indexing='ij')
@@ -147,7 +157,8 @@ def prep(C, t, B):
     W = (windows(C, t, a.lags) - mu_x) / sd_x                                   # (n,L,17,13,C)
     lo = t32(W).permute(0, 1, 4, 2, 3).flatten(1, 2)                             # (n,C*L,17,13): canal = lag*C + var
     ang = 2 * np.pi * hour(t) / 24
-    hh = t32(np.stack([np.sin(ang), np.cos(ang)], 1))                            # (n,2)
+    hf = [np.sin(ang), np.cos(ang)] + (list(np.eye(24)[hour(t)].T) if a.hour_onehot else [])
+    hh = t32(np.stack(hf, 1))                                                    # (n,2 ó 26)
     hi = t32((B - mu_y) / sd_y).permute(0, 3, 1, 2)                              # base normalizada (n,4,70,35)
     return lo, hh, hi
 
@@ -163,9 +174,9 @@ class UNet(nn.Module):
     """Encoder a 27 km -> grid_sample a 3 km -> U-Net de 3 niveles con relieve y la base."""
     def __init__(self, cin, nstatic, w):
         super().__init__()
-        self.enc = nn.Sequential(nn.Conv2d(cin + 2, w, 3, padding=1), nn.GELU(), *[block(w, w) for _ in range(a.enc_blocks)])
+        self.enc = nn.Sequential(nn.Conv2d(cin + NH, w, 3, padding=1), nn.GELU(), *[block(w, w) for _ in range(a.enc_blocks)])
         self.static = nn.Parameter(torch.zeros(1, 8, 70, 35))
-        self.d1, self.d2, self.d3 = block(w + 4 + nstatic + 8 + 2, w), block(w, 2 * w), block(2 * w, 4 * w)
+        self.d1, self.d2, self.d3 = block(w + 4 + nstatic + 8 + NH, w), block(w, 2 * w), block(2 * w, 4 * w)
         if a.attn:   # 18x9 = 162 tokens: contexto de todo el dominio para el viento
             self.pos = nn.Parameter(torch.zeros(1, 18 * 9, 4 * w))
             self.tf = nn.TransformerEncoderLayer(4 * w, 8, 8 * w, dropout=a.drop, batch_first=True, norm_first=True)
@@ -221,7 +232,7 @@ def score(P, Y):
 if val.any():
     print('base sola en val:', score(Btr[val], Ytr[val]))
 
-model = UNet(NC * len(a.lags), S.shape[0], a.width).to(dev)
+model = UNet(NC * NL, S.shape[0], a.width).to(dev)
 opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=a.wd)
 scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
 REF = t32(np.sqrt(((clim_trn[htr[trn]] - Ytr[trn]) ** 2).mean((0, 1, 2))))  # RMSE de la climatología en trn
@@ -260,6 +271,10 @@ for ep in range(a.epochs):
 if swa: model = swa.module                       # pesos promediados: sin mirar val, sirve igual en --full
 elif best_state: model.load_state_dict(best_state)  # ponytail: elegir la mejor época con val es optimista
 torch.save(model.state_dict(), OUT / 'model.pt')
+# lo que el producto necesita para reproducir este modelo con el GFS de Open-Meteo (ver app/modelo.py)
+np.savez(OUT / 'stats.npz', mu_x=mu_x, sd_x=sd_x, mu_y=mu_y, sd_y=sd_y, scale=scale, static=S,
+         base=clim if a.base == 'clim' else bias)   # (24,70,35,4): climatología o sesgo por hora
+json.dump(vars(a), open(OUT / 'args.json', 'w'))
 np.save(OUT / 'test_pred.npy', predict(model, LOte, HHte, HIte, Bte_t))   # submission: train/ensemble.py
 
 row = dict(name=a.name, args=vars(a), best_val=round(best, 4), best_epoch=best_ep, minutes=round((time.time() - t0) / 60, 1))
@@ -278,9 +293,9 @@ if a.explain and val.any():
         + ([f'{v}_24h' for v in VARS] if 'daily' in a.feats else [])
     imp = {}
     for j, n in enumerate(names):      # una variable del GFS, en todas sus horas
-        L = LOv.clone(); ch = [l * NC + j for l in range(len(a.lags))]; L[:, ch] = LOv[perm][:, ch]; imp[f'GFS {n}'] = drop(LO=L)
-    for l, lag in enumerate(a.lags):   # una hora del GFS, todas sus variables
-        L = LOv.clone(); ch = list(range(l * NC, (l + 1) * NC)); L[:, ch] = LOv[perm][:, ch]; imp[f'GFS hora t{lag:+d}'] = drop(LO=L)
+        L = LOv.clone(); ch = [l * NC + j for l in range(NL)]; L[:, ch] = LOv[perm][:, ch]; imp[f'GFS {n}'] = drop(LO=L)
+    for l, lag in enumerate([f't{x:+d}' for x in a.lags] + (['00 UTC del día'] if a.init else [])):   # una hora del GFS
+        L = LOv.clone(); ch = list(range(l * NC, (l + 1) * NC)); L[:, ch] = LOv[perm][:, ch]; imp[f'GFS hora {lag}'] = drop(LO=L)
     imp['hora del día'] = drop(HH=HHv[perm])
     for j, v in enumerate(VARS):       # canal de la base a 3 km
         Hh = HIv.clone(); Hh[:, j] = HIv[perm][:, j]; imp[f'base {v}'] = drop(HI=Hh)
