@@ -1,11 +1,13 @@
 """
-Experimentos BurrosMX: una corrida = un modelo, validado igual que el starter
-(últimas 2 semanas de junio). Resultados en train/runs/log.jsonl.
+Experimentos BurrosMX: una corrida = un modelo. Resultados en train/runs/log.jsonl.
 
-  python train/exp.py --name unet_clim
-  python train/exp.py --name unet_interp_fut --base interp --lags -2 -1 0 1 2
-  python train/exp.py --name final --full --swa_from 8 --epochs 15   # entrena con todo (sin val)
-  python train/ensemble.py sub.csv final        # submission (promedia si das varias corridas)
+  python train/exp.py --name prueba --fold 0                     # valida en 16–30 jun (folds: 0, 1, 2)
+  python train/exp.py --name final --full --epochs 15 --swa_from 8   # entrena con todo (sin val)
+  python train/ensemble.py sub.csv final                         # submission (promedia si das varias corridas)
+  python train/resumen.py                                        # tabla de resultados por configuración
+
+Las opciones nuevas valen por defecto lo que hacía la versión anterior, salvo la purga
+de 24 h alrededor de la validación (evita fuga por autocorrelación en los bordes).
 """
 import argparse, json, time
 from pathlib import Path
@@ -15,40 +17,82 @@ import numpy as np, pandas as pd, torch, torch.nn as nn, torch.nn.functional as 
 ROOT = Path(__file__).resolve().parents[1]
 p = argparse.ArgumentParser()
 p.add_argument('--name', required=True)
+p.add_argument('--fold', type=int, default=0, help='0: 16–30 jun · 1: 1–15 jun · 2: 16–31 may')
+p.add_argument('--full', action='store_true', help='entrena con todo el train (sin validación)')
 p.add_argument('--base', default='clim', choices=['clim', 'interp'])  # sobre qué predice la anomalía
+p.add_argument('--bias_days', type=int, default=0, help='sesgo de la base interp con los N días previos al periodo a predecir (0 = todo)')
+p.add_argument('--recent_days', type=int, default=0, help='repite en cada época los N días más recientes...')
+p.add_argument('--recent_rep', type=int, default=1, help='...esta cantidad de veces')
 p.add_argument('--lags', type=int, nargs='+', default=[-2, -1, 0])     # horas GFS relativas a t
-p.add_argument('--epochs', type=int, default=30)
+p.add_argument('--feats', nargs='*', default=[], choices=['wind', 'vap', 'daily'], help='variables compuestas del GFS')
+p.add_argument('--static_plus', action='store_true', help='más relieve: TPI 3/21, pendiente, orientación')
 p.add_argument('--width', type=int, default=64)
+p.add_argument('--enc_blocks', type=int, default=1, help='bloques conv del encoder a 27 km')
+p.add_argument('--attn', action='store_true', help='transformer en el nivel más bajo de la U-Net (18x9)')
+p.add_argument('--drop', type=float, default=0.0)
+p.add_argument('--epochs', type=int, default=30)
 p.add_argument('--lr', type=float, default=2e-3)
 p.add_argument('--bs', type=int, default=32)
-p.add_argument('--seed', type=int, default=0)
 p.add_argument('--wd', type=float, default=1e-4)
 p.add_argument('--loss', default='mse', choices=['mse', 'metric'])  # metric = promedio de RMSE_v / RMSE_clim_v, como Kaggle
 p.add_argument('--swa_from', type=int, default=0, help='promedia los pesos desde esta época (SWA); 0 = elegir la mejor época en val')
-p.add_argument('--full', action='store_true', help='entrena con todo el train (sin validación)')
+p.add_argument('--amp', action='store_true', help='precisión mixta fp16 (solo CUDA)')
+p.add_argument('--seed', type=int, default=0)
+p.add_argument('--explain', action='store_true', help='importancia por permutación y errores por altura/hora en val')
 a = p.parse_args()
 torch.manual_seed(a.seed); np.random.seed(a.seed)
 dev = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
 OUT = ROOT / 'train' / 'runs' / a.name; OUT.mkdir(parents=True, exist_ok=True)
 VARS = ['RH', 'T', 'U', 'V']
+FOLDS = {0: ('2024061600', '2024070100'), 1: ('2024060100', '2024061600'), 2: ('2024051600', '2024060100')}
 
-# ---------- data ----------
+# ---------- data y partición temporal ----------
 tr, te, st = (np.load(ROOT / 'data' / f) for f in ('train.npz', 'test.npz', 'static.npz'))
 Xtr, Ytr, ttr = tr['X'], tr['Y'], tr['times'].astype(str)
 Xte, tte = te['X'], te['times'].astype(str)
+TS = pd.to_datetime(ttr, format='%Y%m%d%H')
 hour = lambda t: np.array([int(k[-2:]) for k in t])
-val = np.zeros(len(ttr), bool) if a.full else ttr >= '2024061600'
-trn = ~val
+htr, hte = hour(ttr), hour(tte)
+if a.full:
+    val = np.zeros(len(ttr), bool); trn = ~val; END = TS.max() + pd.Timedelta(hours=1)
+else:
+    lo, hi = (pd.Timestamp(pd.to_datetime(s, format='%Y%m%d%H')) for s in FOLDS[a.fold])
+    val = np.asarray((TS >= lo) & (TS < hi))
+    purge = np.asarray((TS >= lo - pd.Timedelta(hours=24)) & (TS < hi + pd.Timedelta(hours=24)))
+    trn = ~purge; END = lo   # END = inicio del periodo a predecir
 
 
-def windows(X, t, lags):  # (n, L, 17, 13, 4); si falta una hora, usa la hora t (como el starter)
+def recent(days):  # máscara de los `days` días de trn más cercanos (antes) al periodo a predecir
+    return trn & np.asarray((TS < END) & (TS >= END - pd.Timedelta(days=days)))
+
+
+# ---------- variables del GFS (27 km) ----------
+def coarse_feats(X, t):
+    RH, T, U, V = (X[..., j] for j in range(4))
+    out = [X]
+    if 'wind' in a.feats:                                   # velocidad y dirección (vector unitario)
+        spd = np.hypot(U, V); out += [spd[..., None], (U / (spd + .1))[..., None], (V / (spd + .1))[..., None]]
+    if 'vap' in a.feats:                                    # presión de vapor (hPa) y punto de rocío (°C)
+        Tc = T - 273.15; e = np.clip(RH, 1, 100) / 100 * 6.112 * np.exp(17.67 * Tc / (Tc + 243.5))
+        ln = np.log(e / 6.112); out += [e[..., None], (243.5 * ln / (17.67 - ln))[..., None]]
+    if 'daily' in a.feats:                                  # media móvil de ±12 h: el "día" alrededor de t
+        ts = pd.to_datetime(t, format='%Y%m%d%H'); pos = {k: i for i, k in enumerate(ts)}
+        acc, cnt = np.zeros_like(X), np.zeros((len(X), 1, 1, 1), np.float32)
+        for o in range(-12, 13):
+            idx = np.array([pos.get(k + pd.Timedelta(hours=o), -1) for k in ts]); ok = idx >= 0
+            acc[ok] += X[idx[ok]]; cnt[ok] += 1
+        out += [acc / cnt]
+    return np.concatenate(out, -1).astype(np.float32)
+
+
+def windows(X, t, lags):  # (n, L, 17, 13, C); si falta una hora, usa la hora t (como el starter)
     ts = pd.to_datetime(t, format='%Y%m%d%H'); pos = {k: i for i, k in enumerate(ts)}
-    out = np.empty((len(X), len(lags)) + X.shape[1:], np.float32)
-    for i, k in enumerate(ts):
-        for j, l in enumerate(lags):
-            out[i, j] = X[pos.get(k + pd.Timedelta(hours=l), i)]
-    return out
+    idx = np.array([[pos.get(k + pd.Timedelta(hours=l), i) for l in lags] for i, k in enumerate(ts)])
+    return X[idx]
 
+
+Ctr, Cte = coarse_feats(Xtr, ttr), coarse_feats(Xte, tte)
+NC = Ctr.shape[-1]
 
 # grilla WRF dentro de la grilla GFS, para grid_sample (igual que el starter)
 LAT, LON = np.meshgrid(st['wrf_lats'], st['wrf_lons'], indexing='ij')
@@ -63,25 +107,34 @@ def interp(X):  # GFS (n,17,13,4) -> (n,70,35,4) bilineal, en CPU
     return F.grid_sample(x, GRID.expand(len(x), -1, -1, -1), align_corners=True).permute(0, 2, 3, 1).numpy()
 
 
-# base: climatología por hora, o GFS interpolado + sesgo medio por (hora, píxel)
-htr, hte = hour(ttr), hour(tte)
+# ---------- base: climatología por hora, o GFS interpolado + sesgo medio por (hora, píxel) ----------
 if a.base == 'clim':
     clim = np.stack([Ytr[trn & (htr == k)].mean(0) for k in range(24)])
     Btr, Bte = clim[htr], clim[hte]
 else:
     Itr, Ite = interp(Xtr), interp(Xte)
-    bias = np.stack([(Ytr - Itr)[trn & (htr == k)].mean(0) for k in range(24)])
+    D = Ytr - Itr
+    all_b = np.stack([D[trn & (htr == k)].mean(0) for k in range(24)])
+    if a.bias_days:  # la temporada cambia el sesgo (RH: +2.9 en marzo, −5.0 en junio): usar días recientes
+        m = recent(a.bias_days)
+        bias = np.stack([D[m & (htr == k)].mean(0) if (m & (htr == k)).any() else all_b[k] for k in range(24)])
+    else:
+        bias = all_b
     Btr, Bte = Itr + bias[htr], Ite + bias[hte]
 scale = (Ytr[trn] - Btr[trn]).std((0, 1, 2))           # por variable
-mu_x, sd_x = Xtr[trn].mean((0, 1, 2)), Xtr[trn].std((0, 1, 2))
+mu_x, sd_x = Ctr[trn].mean((0, 1, 2)), Ctr[trn].std((0, 1, 2)) + 1e-6
 mu_y, sd_y = Ytr[trn].mean((0, 1, 2)), Ytr[trn].std((0, 1, 2))
 
-# estáticos a 3 km: relieve, pendientes y relieve local
+# ---------- relieve a 3 km ----------
 dem = st['dem'].astype(np.float32)
-k = 9; dp = np.pad(dem, k // 2, mode='edge')
-smooth = np.mean([dp[i:i + 70, j:j + 35] for i in range(k) for j in range(k)], 0)
+def box(z, k):
+    zp = np.pad(z, k // 2, mode='edge'); return np.mean([zp[i:i + 70, j:j + 35] for i in range(k) for j in range(k)], 0)
 dy, dx = np.gradient(dem)
-S = np.stack([dem, dx, dy, dem - smooth]); S = (S - S.mean((1, 2), keepdims=True)) / S.std((1, 2), keepdims=True)
+S = [dem, dx, dy, dem - box(dem, 9)]
+if a.static_plus:
+    slope = np.hypot(dx, dy) + 1e-3
+    S += [dem - box(dem, 3), dem - box(dem, 21), slope, dx / slope, dy / slope]
+S = np.stack(S); S = (S - S.mean((1, 2), keepdims=True)) / S.std((1, 2), keepdims=True)
 STATIC = torch.tensor(S[None], dtype=torch.float32, device=dev)
 GRID = GRID.to(dev)
 
@@ -89,9 +142,9 @@ GRID = GRID.to(dev)
 def t32(x): return torch.tensor(x, dtype=torch.float32, device=dev)
 
 
-def prep(X, t, B):
-    W = (windows(X, t, a.lags) - mu_x) / sd_x                                   # (n,L,17,13,4)
-    lo = t32(W).permute(0, 1, 4, 2, 3).flatten(1, 2)                             # (n,4L,17,13)
+def prep(C, t, B):
+    W = (windows(C, t, a.lags) - mu_x) / sd_x                                   # (n,L,17,13,C)
+    lo = t32(W).permute(0, 1, 4, 2, 3).flatten(1, 2)                             # (n,C*L,17,13): canal = lag*C + var
     ang = 2 * np.pi * hour(t) / 24
     hh = t32(np.stack([np.sin(ang), np.cos(ang)], 1))                            # (n,2)
     hi = t32((B - mu_y) / sd_y).permute(0, 3, 1, 2)                              # base normalizada (n,4,70,35)
@@ -100,54 +153,63 @@ def prep(X, t, B):
 
 # ---------- modelo ----------
 def block(i, o):
-    return nn.Sequential(nn.Conv2d(i, o, 3, padding=1), nn.GroupNorm(8, o), nn.GELU(),
-                         nn.Conv2d(o, o, 3, padding=1), nn.GroupNorm(8, o), nn.GELU())
+    layers = [nn.Conv2d(i, o, 3, padding=1), nn.GroupNorm(8, o), nn.GELU(),
+              nn.Conv2d(o, o, 3, padding=1), nn.GroupNorm(8, o), nn.GELU()]
+    return nn.Sequential(*layers, nn.Dropout2d(a.drop)) if a.drop else nn.Sequential(*layers)
 
 
 class UNet(nn.Module):
     """Encoder a 27 km -> grid_sample a 3 km -> U-Net de 3 niveles con relieve y la base."""
-    def __init__(s, L, w):
+    def __init__(self, cin, nstatic, w):
         super().__init__()
-        s.enc = nn.Sequential(nn.Conv2d(4 * L + 2, w, 3, padding=1), nn.GELU(), block(w, w))
-        s.static = nn.Parameter(torch.zeros(1, 8, 70, 35))
-        s.d1, s.d2, s.d3 = block(w + 4 + 4 + 8 + 2, w), block(w, 2 * w), block(2 * w, 4 * w)
-        s.u2, s.u1 = block(6 * w, 2 * w), block(3 * w, w)
-        s.out = nn.Conv2d(w, 4, 1)
+        self.enc = nn.Sequential(nn.Conv2d(cin + 2, w, 3, padding=1), nn.GELU(), *[block(w, w) for _ in range(a.enc_blocks)])
+        self.static = nn.Parameter(torch.zeros(1, 8, 70, 35))
+        self.d1, self.d2, self.d3 = block(w + 4 + nstatic + 8 + 2, w), block(w, 2 * w), block(2 * w, 4 * w)
+        if a.attn:   # 18x9 = 162 tokens: contexto de todo el dominio para el viento
+            self.pos = nn.Parameter(torch.zeros(1, 18 * 9, 4 * w))
+            self.tf = nn.TransformerEncoderLayer(4 * w, 8, 8 * w, dropout=a.drop, batch_first=True, norm_first=True)
+        self.u2, self.u1 = block(6 * w, 2 * w), block(3 * w, w)
+        self.out = nn.Conv2d(w, 4, 1)
 
-    def forward(s, lo, hh, hi):
+    def forward(self, lo, hh, hi):
         B = lo.shape[0]
         H = hh[..., None, None]
-        f = s.enc(torch.cat([lo, H.expand(-1, -1, 17, 13)], 1))
-        f = F.grid_sample(f, GRID.expand(B, -1, -1, -1), align_corners=True)
-        x = torch.cat([f, hi, STATIC.expand(B, -1, -1, -1), s.static.expand(B, -1, -1, -1), H.expand(-1, -1, 70, 35)], 1)
-        e1 = s.d1(x)
-        e2 = s.d2(F.avg_pool2d(e1, 2, ceil_mode=True))
-        e3 = s.d3(F.avg_pool2d(e2, 2, ceil_mode=True))
+        f = self.enc(torch.cat([lo, H.expand(-1, -1, 17, 13)], 1))
+        f = F.grid_sample(f, GRID.expand(B, -1, -1, -1).to(f.dtype), align_corners=True)
+        x = torch.cat([f, hi, STATIC.expand(B, -1, -1, -1).to(f.dtype), self.static.expand(B, -1, -1, -1).to(f.dtype),
+                       H.expand(-1, -1, 70, 35).to(f.dtype)], 1)
+        e1 = self.d1(x)
+        e2 = self.d2(F.avg_pool2d(e1, 2, ceil_mode=True))
+        e3 = self.d3(F.avg_pool2d(e2, 2, ceil_mode=True))
+        if a.attn:
+            b, c, hgt, wid = e3.shape
+            e3 = self.tf(e3.flatten(2).transpose(1, 2) + self.pos).transpose(1, 2).reshape(b, c, hgt, wid)
         up = lambda z, ref: F.interpolate(z, size=ref.shape[-2:], mode='bilinear', align_corners=False)
-        u2 = s.u2(torch.cat([up(e3, e2), e2], 1))
-        u1 = s.u1(torch.cat([up(u2, e1), e1], 1))
-        return s.out(u1).permute(0, 2, 3, 1)  # anomalía normalizada (B,70,35,4)
+        u2 = self.u2(torch.cat([up(e3, e2), e2], 1))
+        u1 = self.u1(torch.cat([up(u2, e1), e1], 1))
+        return self.out(u1).permute(0, 2, 3, 1)  # anomalía normalizada (B,70,35,4)
 
 
-LOtr, HHtr, HItr = prep(Xtr, ttr, Btr)
-LOte, HHte, HIte = prep(Xte, tte, Bte)
+LOtr, HHtr, HItr = prep(Ctr, ttr, Btr)
+LOte, HHte, HIte = prep(Cte, tte, Bte)
 Btr_t, Bte_t, SC = t32(Btr), t32(Bte), t32(scale)
 Ytr_t = t32(Ytr)
+use_amp = a.amp and dev == 'cuda'
 
 
 def predict(model, LO, HH, HI, B, bs=128):
     model.eval(); out = []
-    with torch.no_grad():
+    with torch.no_grad(), torch.autocast('cuda', torch.float16, enabled=use_amp):
         for i in range(0, len(LO), bs):
-            out.append((B[i:i + bs] + model(LO[i:i + bs], HH[i:i + bs], HI[i:i + bs]) * SC).cpu().numpy())
+            out.append((B[i:i + bs] + model(LO[i:i + bs], HH[i:i + bs], HI[i:i + bs]).float() * SC).cpu().numpy())
     P = np.concatenate(out); P[..., 0] = P[..., 0].clip(0, 100)
     return P
 
 
 # score local: misma fórmula que Kaggle, con la climatología (de trn) como referencia en val
+clim_trn = np.stack([Ytr[trn & (htr == k)].mean(0) for k in range(24)])
 if val.any():
-    clim_ref = np.stack([Ytr[trn & (htr == k)].mean(0) for k in range(24)])
-    ref = np.sqrt(((clim_ref[htr[val]] - Ytr[val]) ** 2).mean((0, 1, 2)))
+    ref = np.sqrt(((clim_trn[htr[val]] - Ytr[val]) ** 2).mean((0, 1, 2)))
 
 
 def score(P, Y):
@@ -158,29 +220,35 @@ def score(P, Y):
 if val.any():
     print('base sola en val:', score(Btr[val], Ytr[val]))
 
-model = UNet(len(a.lags), a.width).to(dev)
+model = UNet(NC * len(a.lags), S.shape[0], a.width).to(dev)
 opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=a.wd)
-clim_trn = np.stack([Ytr[trn & (htr == k)].mean(0) for k in range(24)])
+scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
 REF = t32(np.sqrt(((clim_trn[htr[trn]] - Ytr[trn]) ** 2).mean((0, 1, 2))))  # RMSE de la climatología en trn
 
 
 def loss_fn(pred, y):
     if a.loss == 'mse': return F.mse_loss(pred, y)
     return (((pred - y) * SC).pow(2).mean((0, 1, 2)).add(1e-8).sqrt() / REF).mean()
+
+
 itr = np.where(trn)[0]
+if a.recent_rep > 1 and a.recent_days:  # sobremuestrea lo más parecido (en temporada) al periodo a predecir
+    itr = np.concatenate([itr] + [np.where(recent(a.recent_days))[0]] * (a.recent_rep - 1))
 steps = a.epochs * int(np.ceil(len(itr) / a.bs))
 sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=a.lr, total_steps=steps)
 swa = torch.optim.swa_utils.AveragedModel(model) if a.swa_from else None
+vi = torch.tensor(np.where(val)[0], device=dev)
 best, best_ep, best_state, t0 = -9e9, -1, None, time.time()
 for ep in range(a.epochs):
     model.train(); np.random.shuffle(itr)
     for i in range(0, len(itr), a.bs):
         b = torch.tensor(itr[i:i + a.bs], device=dev)
         y = (Ytr_t[b] - Btr_t[b]) / SC
-        loss = loss_fn(model(LOtr[b], HHtr[b], HItr[b]), y)
-        opt.zero_grad(); loss.backward(); opt.step(); sched.step()
+        with torch.autocast('cuda', torch.float16, enabled=use_amp):
+            pred = model(LOtr[b], HHtr[b], HItr[b])
+        loss = loss_fn(pred.float(), y)
+        opt.zero_grad(); scaler.scale(loss).backward(); scaler.step(opt); scaler.update(); sched.step()
     if val.any():
-        vi = torch.tensor(np.where(val)[0], device=dev)
         sc, pv = score(predict(model, LOtr[vi], HHtr[vi], HItr[vi], Btr_t[vi]), Ytr[val])
         if sc > best: best, best_ep, best_state = sc, ep + 1, {k: v.clone() for k, v in model.state_dict().items()}
         print(f'ep {ep + 1:02d} · val {sc:.4f} · {pv} · {time.time() - t0:.0f}s', flush=True)
@@ -192,8 +260,41 @@ np.save(OUT / 'test_pred.npy', predict(model, LOte, HHte, HIte, Bte_t))   # subm
 
 row = dict(name=a.name, args=vars(a), best_val=round(best, 4), best_epoch=best_ep, minutes=round((time.time() - t0) / 60, 1))
 if val.any():
-    vi = torch.tensor(np.where(val)[0], device=dev)
     Pv = predict(model, LOtr[vi], HHtr[vi], HItr[vi], Btr_t[vi]); np.save(OUT / 'val_pred.npy', Pv)
     sc, row['per_var_rmse'] = score(Pv, Ytr[val]); row['val'] = round(sc, 4)   # score del modelo guardado
+
+# ---------- explicabilidad (sobre val) ----------
+if a.explain and val.any():
+    rng = np.random.default_rng(0); perm = torch.tensor(rng.permutation(len(vi)), device=dev)
+    LOv, HHv, HIv, Bv = LOtr[vi], HHtr[vi], HItr[vi], Btr_t[vi]
+    base_sc = score(predict(model, LOv, HHv, HIv, Bv), Ytr[val])[0]
+    def drop(LO=LOv, HH=HHv, HI=HIv):
+        return round(base_sc - score(predict(model, LO, HH, HI, Bv), Ytr[val])[0], 4)
+    names = VARS + (['vel', 'dir_u', 'dir_v'] if 'wind' in a.feats else []) + (['e', 'Td'] if 'vap' in a.feats else []) \
+        + ([f'{v}_24h' for v in VARS] if 'daily' in a.feats else [])
+    imp = {}
+    for j, n in enumerate(names):      # una variable del GFS, en todas sus horas
+        L = LOv.clone(); ch = [l * NC + j for l in range(len(a.lags))]; L[:, ch] = LOv[perm][:, ch]; imp[f'GFS {n}'] = drop(LO=L)
+    for l, lag in enumerate(a.lags):   # una hora del GFS, todas sus variables
+        L = LOv.clone(); ch = list(range(l * NC, (l + 1) * NC)); L[:, ch] = LOv[perm][:, ch]; imp[f'GFS hora t{lag:+d}'] = drop(LO=L)
+    imp['hora del día'] = drop(HH=HHv[perm])
+    for j, v in enumerate(VARS):       # canal de la base a 3 km
+        Hh = HIv.clone(); Hh[:, j] = HIv[perm][:, j]; imp[f'base {v}'] = drop(HI=Hh)
+    S0 = STATIC
+    snames = ['altura', 'dx', 'dy', 'TPI9'] + (['TPI3', 'TPI21', 'pendiente', 'orient_x', 'orient_y'] if a.static_plus else [])
+    for k, n in enumerate(snames):     # relieve: se anula el canal (ablación)
+        STATIC = S0.clone(); STATIC[:, k] = 0; imp[f'relieve {n}'] = drop()
+    STATIC = S0
+    row['importancia'] = dict(sorted(imp.items(), key=lambda kv: -kv[1]))
+    # errores por píxel, por banda de altura y por hora
+    err = (Pv - Ytr[val]) ** 2
+    rel = np.sqrt(err.mean(0)) / ref                                            # (70,35,4) error relativo a la climatología
+    bands = [0, 1000, 2000, 3000, 4000, 6000]
+    row['error_por_altura'] = {f'{bands[i]}-{bands[i + 1]} m': np.round(np.sqrt(err[:, (dem >= bands[i]) & (dem < bands[i + 1])].mean((0, 1))) / ref, 3).tolist()
+                               for i in range(len(bands) - 1)}
+    hv = htr[val]
+    row['error_por_hora_utc'] = {int(k): np.round(np.sqrt(err[hv == k].mean((0, 1, 2))) / ref, 3).tolist() for k in np.unique(hv)}
+    np.save(OUT / 'error_rel_pixel.npy', rel)
+
 with open(ROOT / 'train' / 'runs' / 'log.jsonl', 'a') as f: f.write(json.dumps(row) + '\n')
 print('RESULTADO', json.dumps(row))
