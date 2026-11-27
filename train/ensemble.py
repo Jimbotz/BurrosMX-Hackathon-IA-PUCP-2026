@@ -5,6 +5,7 @@ Promedia las predicciones de varias corridas de train/exp.py.
   python train/ensemble.py greedy cfg1 cfg2 ...          # selección greedy por variable (Caruana) sobre los 3 folds
   python train/ensemble.py sub.csv run1 run2 ...         # submission de Kaggle (test_pred.npy, promedio simple)
   python train/ensemble.py sub.csv run1:2 run2:1 ...     # ... con pesos (repeticiones)
+  python train/ensemble.py sub.csv train/runs/ensamble.json   # pesos por variable que escribe greedy
 """
 import json, sys
 from collections import Counter
@@ -61,10 +62,18 @@ if mode in ('val', 'greedy'):
             print(f'{v}: ratio CV {best:.4f} · pesos {dict(Counter(sel))}')
         r = cv(chosen)
         print('ensamble greedy · score por fold', np.round(1 - r.mean(1), 4).tolist(), '· media', round(float(1 - r.mean()), 4))
-        json.dump(dict(zip(VARS, [dict(Counter(s)) for s in chosen])), open(RUNS / 'greedy_pesos.json', 'w'), indent=1)
-else:  # submission; "run:k" = peso k
-    w = [(n.split(':')[0], int(n.split(':')[1]) if ':' in n else 1) for n in names]
-    P = sum(k * np.load(RUNS / n / 'test_pred.npy') for n, k in w) / sum(k for _, k in w)
+        # pesos por variable para los modelos finales (entrenados con --full como full_<cfg>): lo usan la submission y modelo.Ensamble
+        cnt = [Counter(s) for s in chosen]
+        pesos = {f'full_{n}': [c.get(n, 0) for c in cnt] for n in names if any(c.get(n) for c in cnt)}
+        json.dump(pesos, open(RUNS / 'ensamble.json', 'w'), indent=1)
+        print('escrito train/runs/ensamble.json con', len(pesos), 'modelos')
+else:  # submission: "run:k" = peso k para las 4 variables, o un ensamble.json con pesos por variable
+    if names[0].endswith('.json'):
+        w = {n: np.asarray(v, np.float32) for n, v in json.load(open(names[0])).items()}
+        P = sum(np.load(RUNS / n / 'test_pred.npy') * v for n, v in w.items()) / sum(w.values())
+    else:
+        w = [(n.split(':')[0], int(n.split(':')[1]) if ':' in n else 1) for n in names]
+        P = sum(k * np.load(RUNS / n / 'test_pred.npy') for n, k in w) / sum(k for _, k in w)
     tte = np.load(ROOT / 'data' / 'test.npz')['times'].astype(str)
     sample = pd.read_csv(ROOT / 'data' / 'sample_submission.csv')
     parts = sample['id'].str.split('_', expand=True)
