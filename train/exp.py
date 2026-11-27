@@ -27,7 +27,7 @@ p.add_argument('--bias_days', type=int, default=0, help='sesgo de la base interp
 p.add_argument('--recent_days', type=int, default=0, help='repite en cada época los N días más recientes...')
 p.add_argument('--recent_rep', type=int, default=1, help='...esta cantidad de veces')
 p.add_argument('--lags', type=int, nargs='+', default=[-2, -1, 0])     # horas GFS relativas a t
-p.add_argument('--feats', nargs='*', default=[], choices=['wind', 'vap', 'daily'], help='variables compuestas del GFS')
+p.add_argument('--feats', nargs='*', default=[], choices=['wind', 'vap', 'daily', 'semana'], help='variables compuestas del GFS')
 p.add_argument('--static_plus', action='store_true', help='más relieve: TPI 3/21, pendiente, orientación')
 # el WRF se reinicia cada día a las 00 UTC desde el GFS (salto en Y a las 00 UTC, ver analysis/): la hora UTC es
 # el tiempo de pronóstico de esa corrida y el GFS de las 00 UTC del día es su condición inicial
@@ -36,6 +36,7 @@ p.add_argument('--init', action='store_true', help='agrega el GFS de las 00 UTC 
 p.add_argument('--width', type=int, default=64)
 p.add_argument('--enc_blocks', type=int, default=1, help='bloques conv del encoder a 27 km')
 p.add_argument('--attn', action='store_true', help='transformer en el nivel más bajo de la U-Net (18x9)')
+p.add_argument('--xattn', action='store_true', help='atención cruzada: la grilla fina (18x9) mira a todo el GFS (17x13)')
 p.add_argument('--drop', type=float, default=0.0)
 p.add_argument('--epochs', type=int, default=30)
 p.add_argument('--lr', type=float, default=2e-3)
@@ -200,7 +201,8 @@ if a.explain and val.any():
     def drop(LO=LOv, HH=HHv, HI=HIv):
         return round(base_sc - score(predict(model, LO, HH, HI, Bv), Ytr[val])[0], 4)
     names = VARS + (['vel', 'dir_u', 'dir_v'] if 'wind' in a.feats else []) + (['e', 'Td'] if 'vap' in a.feats else []) \
-        + ([f'{v}_24h' for v in VARS] if 'daily' in a.feats else [])
+        + ([f'{v}_24h' for v in VARS] if 'daily' in a.feats else []) \
+        + ([f'{v}_semana' for v in VARS] + [f'{v}_tendencia' for v in VARS] if 'semana' in a.feats else [])
     imp = {}
     for j, n in enumerate(names):      # una variable del GFS, en todas sus horas
         L = LOv.clone(); ch = [l * NC + j for l in range(NL)]; L[:, ch] = LOv[perm][:, ch]; imp[f'GFS {n}'] = drop(LO=L)
@@ -218,7 +220,7 @@ if a.explain and val.any():
     # errores por píxel, por banda de altura y por hora
     err = (Pv - Ytr[val]) ** 2
     rel = np.sqrt(err.mean(0)) / ref                                            # (70,35,4) error relativo a la climatología
-    bands = [0, 1000, 2000, 3000, 4000, 6000]
+    dem = st["dem"]; bands = [0, 1000, 2000, 3000, 4000, 6000]
     row['error_por_altura'] = {f'{bands[i]}-{bands[i + 1]} m': np.round(np.sqrt(err[:, (dem >= bands[i]) & (dem < bands[i + 1])].mean((0, 1))) / ref, 3).tolist()
                                for i in range(len(bands) - 1)}
     hv = htr[val]

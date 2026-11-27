@@ -35,6 +35,16 @@ def coarse_feats(X, t, feats):
             idx = np.array([pos.get(k + pd.Timedelta(hours=o), -1) for k in ts]); ok = idx >= 0
             acc[ok] += X[idx[ok]]; cnt[ok] += 1
         out += [acc / cnt]
+    if 'semana' in feats:                                   # media de ±3.5 días y tendencia (próximos − pasados)
+        ts = pd.to_datetime(t, format='%Y%m%d%H'); pos = {k: i for i, k in enumerate(ts)}
+        def media(lo, hi):
+            acc, cnt = np.zeros_like(X), np.zeros((len(X), 1, 1, 1), np.float32)
+            for o in range(lo, hi + 1):
+                idx = np.array([pos.get(k + pd.Timedelta(hours=o), -1) for k in ts]); ok = idx >= 0
+                acc[ok] += X[idx[ok]]; cnt[ok] += 1
+            return acc / np.maximum(cnt, 1)
+        pas, fut = media(-84, 0), media(0, 84)
+        out += [(pas + fut) / 2, fut - pas]
     return np.concatenate(out, -1).astype(np.float32)
 
 
@@ -93,7 +103,7 @@ def block(i, o, drop=0.0):
 class UNet(nn.Module):
     """Encoder a 27 km -> grid_sample a 3 km -> U-Net de 3 niveles con relieve, base y hora.
     Predice la anomalía normalizada respecto de la base."""
-    def __init__(self, cin, nh, G, S, w=64, enc_blocks=1, attn=False, drop=0.0):
+    def __init__(self, cin, nh, G, S, w=64, enc_blocks=1, attn=False, drop=0.0, xattn=False):
         super().__init__()
         self.register_buffer('G', G, persistent=False)          # no van al state_dict: se recalculan
         self.register_buffer('S', torch.as_tensor(S)[None], persistent=False)
@@ -106,12 +116,20 @@ class UNet(nn.Module):
             self.tf = nn.TransformerEncoderLayer(4 * w, 8, 8 * w, dropout=drop, batch_first=True, norm_first=True)
         self.u2, self.u1 = block(6 * w, 2 * w, drop), block(3 * w, w, drop)
         self.out = nn.Conv2d(w, 4, 1)
+        self.xattn = xattn
+        if xattn:   # cada zona de la grilla fina (18x9) mira a las 17x13 celdas del GFS: ¿de qué flujo depende su viento?
+            self.kv = nn.Linear(w, 4 * w)
+            self.cpos = nn.Parameter(torch.zeros(1, 17 * 13, 4 * w))
+            self.qpos = nn.Parameter(torch.zeros(1, 18 * 9, 4 * w))
+            self.xnorm = nn.LayerNorm(4 * w)
+            self.xa = nn.MultiheadAttention(4 * w, 8, dropout=drop, batch_first=True)
+            self.keep_attn = False; self.last_attn = None   # para explicabilidad: pesos (B, 162, 221)
 
     def forward(self, lo, hh, hi):
         B = lo.shape[0]
         H = hh[..., None, None]
-        f = self.enc(torch.cat([lo, H.expand(-1, -1, 17, 13)], 1))
-        f = F.grid_sample(f, self.G.expand(B, -1, -1, -1).to(f.dtype), align_corners=True)
+        fc = self.enc(torch.cat([lo, H.expand(-1, -1, 17, 13)], 1))
+        f = F.grid_sample(fc, self.G.expand(B, -1, -1, -1).to(fc.dtype), align_corners=True)
         x = torch.cat([f, hi, self.S.expand(B, -1, -1, -1).to(f.dtype), self.static.expand(B, -1, -1, -1).to(f.dtype),
                        H.expand(-1, -1, 70, 35).to(f.dtype)], 1)
         e1 = self.d1(x)
@@ -120,6 +138,13 @@ class UNet(nn.Module):
         if self.attn:
             b, c, hgt, wid = e3.shape
             e3 = self.tf(e3.flatten(2).transpose(1, 2) + self.pos).transpose(1, 2).reshape(b, c, hgt, wid)
+        if self.xattn:
+            b, c, hgt, wid = e3.shape
+            q = self.xnorm(e3.flatten(2).transpose(1, 2) + self.qpos)
+            kv = self.kv(fc.flatten(2).transpose(1, 2)) + self.cpos
+            o, att = self.xa(q, kv, kv, need_weights=self.keep_attn)
+            if self.keep_attn: self.last_attn = att.detach()
+            e3 = e3 + o.transpose(1, 2).reshape(b, c, hgt, wid)
         up = lambda z, ref: F.interpolate(z, size=ref.shape[-2:], mode='bilinear', align_corners=False)
         u2 = self.u2(torch.cat([up(e3, e2), e2], 1))
         u1 = self.u1(torch.cat([up(u2, e1), e1], 1))
@@ -132,7 +157,7 @@ def build(cfg, st, S):
     nc = coarse_feats(dummy, ['2024010100'], cfg['feats']).shape[-1]
     nl = len(cfg['lags']) + bool(cfg.get('init'))
     return UNet(nc * nl, 26 if cfg.get('hour_onehot') else 2, grid(st), S, cfg['width'],
-                cfg.get('enc_blocks', 1), cfg.get('attn', False), cfg.get('drop', 0.0))
+                cfg.get('enc_blocks', 1), cfg.get('attn', False), cfg.get('drop', 0.0), cfg.get('xattn', False))
 
 
 class Corrida:
