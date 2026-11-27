@@ -103,17 +103,18 @@ def block(i, o, drop=0.0):
 class UNet(nn.Module):
     """Encoder a 27 km -> grid_sample a 3 km -> U-Net de 3 niveles con relieve, base y hora.
     Predice la anomalía normalizada respecto de la base."""
-    def __init__(self, cin, nh, G, S, w=64, enc_blocks=1, attn=False, drop=0.0, xattn=False):
+    def __init__(self, cin, nh, G, S, w=64, enc_blocks=1, attn=False, drop=0.0, xattn=False,
+                 tattn=None, postnorm=False):
         super().__init__()
         self.register_buffer('G', G, persistent=False)          # no van al state_dict: se recalculan
         self.register_buffer('S', torch.as_tensor(S)[None], persistent=False)
         self.attn = attn
-        self.enc = nn.Sequential(nn.Conv2d(cin + nh, w, 3, padding=1), nn.GELU(), *[block(w, w, drop) for _ in range(enc_blocks)])
+        self.enc = nn.Sequential(nn.Conv2d((tattn['d'] if tattn else cin) + nh, w, 3, padding=1), nn.GELU(), *[block(w, w, drop) for _ in range(enc_blocks)])
         self.static = nn.Parameter(torch.zeros(1, 8, 70, 35))
         self.d1, self.d2, self.d3 = block(w + 4 + S.shape[0] + 8 + nh, w, drop), block(w, 2 * w, drop), block(2 * w, 4 * w, drop)
         if attn:   # 18x9 = 162 tokens: contexto de todo el dominio
             self.pos = nn.Parameter(torch.zeros(1, 18 * 9, 4 * w))
-            self.tf = nn.TransformerEncoderLayer(4 * w, 8, 8 * w, dropout=drop, batch_first=True, norm_first=True)
+            self.tf = nn.TransformerEncoderLayer(4 * w, 8, 8 * w, dropout=drop, batch_first=True, norm_first=not postnorm)
         self.u2, self.u1 = block(6 * w, 2 * w, drop), block(3 * w, w, drop)
         self.out = nn.Conv2d(w, 4, 1)
         self.xattn = xattn
@@ -124,10 +125,23 @@ class UNet(nn.Module):
             self.xnorm = nn.LayerNorm(4 * w)
             self.xa = nn.MultiheadAttention(4 * w, 8, dropout=drop, batch_first=True)
             self.keep_attn = False; self.last_attn = None   # para explicabilidad: pesos (B, 162, 221)
+        self.postnorm = postnorm
+        self.tattn = tattn
+        if tattn:   # atención en el TIEMPO: cada celda GFS ve su secuencia de horas; causal = solo horas <= t
+            L, C, d = tattn['L'], tattn['C'], tattn['d']
+            self.tin = nn.Linear(C, d)
+            self.tpos = nn.Parameter(torch.zeros(1, L, d))
+            self.ttf = nn.TransformerEncoderLayer(d, 4, 2 * d, dropout=drop, batch_first=True, norm_first=not postnorm)
+            self.register_buffer('tmask', nn.Transformer.generate_square_subsequent_mask(L) if tattn['causal'] else None, persistent=False)
 
     def forward(self, lo, hh, hi):
         B = lo.shape[0]
         H = hh[..., None, None]
+        if self.tattn:   # (B, L*C, 17, 13) -> secuencias (B*221, L, C) -> token de la hora t -> (B, d, 17, 13)
+            L, C, d, i0 = self.tattn['L'], self.tattn['C'], self.tattn['d'], self.tattn['i0']
+            seq = lo.reshape(B, L, C, 17 * 13).permute(0, 3, 1, 2).reshape(B * 221, L, C)
+            z = self.ttf(self.tin(seq) + self.tpos, src_mask=self.tmask, is_causal=self.tmask is not None)
+            lo = z[:, i0].reshape(B, 221, d).transpose(1, 2).reshape(B, d, 17, 13)
         fc = self.enc(torch.cat([lo, H.expand(-1, -1, 17, 13)], 1))
         f = F.grid_sample(fc, self.G.expand(B, -1, -1, -1).to(fc.dtype), align_corners=True)
         x = torch.cat([f, hi, self.S.expand(B, -1, -1, -1).to(f.dtype), self.static.expand(B, -1, -1, -1).to(f.dtype),
@@ -140,11 +154,12 @@ class UNet(nn.Module):
             e3 = self.tf(e3.flatten(2).transpose(1, 2) + self.pos).transpose(1, 2).reshape(b, c, hgt, wid)
         if self.xattn:
             b, c, hgt, wid = e3.shape
-            q = self.xnorm(e3.flatten(2).transpose(1, 2) + self.qpos)
+            q = e3.flatten(2).transpose(1, 2) + self.qpos
             kv = self.kv(fc.flatten(2).transpose(1, 2)) + self.cpos
-            o, att = self.xa(q, kv, kv, need_weights=self.keep_attn)
+            o, att = self.xa(q if self.postnorm else self.xnorm(q), kv, kv, need_weights=self.keep_attn)
             if self.keep_attn: self.last_attn = att.detach()
-            e3 = e3 + o.transpose(1, 2).reshape(b, c, hgt, wid)
+            r = e3.flatten(2).transpose(1, 2) + o                       # residual; post-norm normaliza después
+            e3 = (self.xnorm(r) if self.postnorm else r).transpose(1, 2).reshape(b, c, hgt, wid)
         up = lambda z, ref: F.interpolate(z, size=ref.shape[-2:], mode='bilinear', align_corners=False)
         u2 = self.u2(torch.cat([up(e3, e2), e2], 1))
         u1 = self.u1(torch.cat([up(u2, e1), e1], 1))
@@ -156,8 +171,13 @@ def build(cfg, st, S):
     dummy = np.broadcast_to(np.float32([50, 280, 0, 0]), (1, 17, 13, 4)).copy()   # solo para contar canales
     nc = coarse_feats(dummy, ['2024010100'], cfg['feats']).shape[-1]
     nl = len(cfg['lags']) + bool(cfg.get('init'))
+    tattn = None
+    if cfg.get('tattn'):
+        assert not cfg.get('init') and sorted(cfg['lags']) == list(cfg['lags']) and 0 in cfg['lags'], 'tattn: lags ordenados con 0, sin init'
+        tattn = dict(L=nl, C=nc, d=64, i0=list(cfg['lags']).index(0), causal=cfg['tattn'] == 'causal')
     return UNet(nc * nl, 26 if cfg.get('hour_onehot') else 2, grid(st), S, cfg['width'],
-                cfg.get('enc_blocks', 1), cfg.get('attn', False), cfg.get('drop', 0.0), cfg.get('xattn', False))
+                cfg.get('enc_blocks', 1), cfg.get('attn', False), cfg.get('drop', 0.0), cfg.get('xattn', False),
+                tattn, cfg.get('postnorm', False))
 
 
 class Corrida:
