@@ -12,9 +12,12 @@ de 24 h alrededor de la validación (evita fuga por autocorrelación en los bord
 import argparse, json, time
 from pathlib import Path
 
-import numpy as np, pandas as pd, torch, torch.nn as nn, torch.nn.functional as F
+import sys
+import numpy as np, pandas as pd, torch, torch.nn.functional as F
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from modelo import coarse_feats, windows, hour, hour_feats, grid, interp, static_feats, build  # noqa: E402
 p = argparse.ArgumentParser()
 p.add_argument('--name', required=True)
 p.add_argument('--fold', type=int, default=0, help='0: 16–30 jun · 1: 1–15 jun · 2: 16–31 may')
@@ -56,7 +59,6 @@ tr, te, st = (np.load(ROOT / 'data' / f) for f in ('train.npz', 'test.npz', 'sta
 Xtr, Ytr, ttr = tr['X'], tr['Y'], tr['times'].astype(str)
 Xte, tte = te['X'], te['times'].astype(str)
 TS = pd.to_datetime(ttr, format='%Y%m%d%H')
-hour = lambda t: np.array([int(k[-2:]) for k in t])
 htr, hte = hour(ttr), hour(tte)
 if a.full:
     val = np.zeros(len(ttr), bool); trn = ~val; END = TS.max() + pd.Timedelta(hours=1)
@@ -71,51 +73,11 @@ def recent(days):  # máscara de los `days` días de trn más cercanos (antes) a
     return trn & np.asarray((TS < END) & (TS >= END - pd.Timedelta(days=days)))
 
 
-# ---------- variables del GFS (27 km) ----------
-def coarse_feats(X, t):
-    RH, T, U, V = (X[..., j] for j in range(4))
-    out = [X]
-    if 'wind' in a.feats:                                   # velocidad y dirección (vector unitario)
-        spd = np.hypot(U, V); out += [spd[..., None], (U / (spd + .1))[..., None], (V / (spd + .1))[..., None]]
-    if 'vap' in a.feats:                                    # presión de vapor (hPa) y punto de rocío (°C)
-        Tc = T - 273.15; e = np.clip(RH, 1, 100) / 100 * 6.112 * np.exp(17.67 * Tc / (Tc + 243.5))
-        ln = np.log(e / 6.112); out += [e[..., None], (243.5 * ln / (17.67 - ln))[..., None]]
-    if 'daily' in a.feats:                                  # media móvil de ±12 h: el "día" alrededor de t
-        ts = pd.to_datetime(t, format='%Y%m%d%H'); pos = {k: i for i, k in enumerate(ts)}
-        acc, cnt = np.zeros_like(X), np.zeros((len(X), 1, 1, 1), np.float32)
-        for o in range(-12, 13):
-            idx = np.array([pos.get(k + pd.Timedelta(hours=o), -1) for k in ts]); ok = idx >= 0
-            acc[ok] += X[idx[ok]]; cnt[ok] += 1
-        out += [acc / cnt]
-    return np.concatenate(out, -1).astype(np.float32)
-
-
-def windows(X, t, lags):  # (n, L[+1], 17, 13, C); si falta una hora, usa la hora t (como el starter)
-    ts = pd.to_datetime(t, format='%Y%m%d%H'); pos = {k: i for i, k in enumerate(ts)}
-    idx = [[pos.get(k + pd.Timedelta(hours=l), i) for l in lags] for i, k in enumerate(ts)]
-    if a.init:   # 00 UTC del mismo día; si falta, la primera hora disponible de ese día
-        first = {}
-        for i, k in enumerate(ts): first.setdefault(k.normalize(), i)
-        idx = [r + [pos.get(k.normalize(), first[k.normalize()])] for r, k in zip(idx, ts)]
-    return X[np.array(idx)]
-
-
-Ctr, Cte = coarse_feats(Xtr, ttr), coarse_feats(Xte, tte)
+# ---------- variables del GFS (27 km): ver modelo.py ----------
+Ctr, Cte = coarse_feats(Xtr, ttr, a.feats), coarse_feats(Xte, tte, a.feats)
 NC = Ctr.shape[-1]
 NL = len(a.lags) + a.init          # horas del GFS que ve el modelo
-NH = 26 if a.hour_onehot else 2    # canales de hora
-
-# grilla WRF dentro de la grilla GFS, para grid_sample (igual que el starter)
-LAT, LON = np.meshgrid(st['wrf_lats'], st['wrf_lons'], indexing='ij')
-glat, glon = st['gfs_lats'], st['gfs_lons']
-gy = (LAT - glat[0]) / (glat[-1] - glat[0]) * 2 - 1
-gx = (LON - glon[0]) / (glon[-1] - glon[0]) * 2 - 1
-GRID = torch.tensor(np.stack([gx, gy], -1)[None], dtype=torch.float32)
-
-
-def interp(X):  # GFS (n,17,13,4) -> (n,70,35,4) bilineal, en CPU
-    x = torch.tensor(X).permute(0, 3, 1, 2)
-    return F.grid_sample(x, GRID.expand(len(x), -1, -1, -1), align_corners=True).permute(0, 2, 3, 1).numpy()
+GRID = grid(st)
 
 
 # ---------- base: climatología por hora, o GFS interpolado + sesgo medio por (hora, píxel) ----------
@@ -123,7 +85,7 @@ if a.base == 'clim':
     clim = np.stack([Ytr[trn & (htr == k)].mean(0) for k in range(24)])
     Btr, Bte = clim[htr], clim[hte]
 else:
-    Itr, Ite = interp(Xtr), interp(Xte)
+    Itr, Ite = interp(Xtr, GRID), interp(Xte, GRID)
     D = Ytr - Itr
     all_b = np.stack([D[trn & (htr == k)].mean(0) for k in range(24)])
     if a.bias_days:  # la temporada cambia el sesgo (RH: +2.9 en marzo, −5.0 en junio): usar días recientes
@@ -136,70 +98,18 @@ scale = (Ytr[trn] - Btr[trn]).std((0, 1, 2))           # por variable
 mu_x, sd_x = Ctr[trn].mean((0, 1, 2)), Ctr[trn].std((0, 1, 2)) + 1e-6
 mu_y, sd_y = Ytr[trn].mean((0, 1, 2)), Ytr[trn].std((0, 1, 2))
 
-# ---------- relieve a 3 km ----------
-dem = st['dem'].astype(np.float32)
-def box(z, k):
-    zp = np.pad(z, k // 2, mode='edge'); return np.mean([zp[i:i + 70, j:j + 35] for i in range(k) for j in range(k)], 0)
-dy, dx = np.gradient(dem)
-S = [dem, dx, dy, dem - box(dem, 9)]
-if a.static_plus:
-    slope = np.hypot(dx, dy) + 1e-3
-    S += [dem - box(dem, 3), dem - box(dem, 21), slope, dx / slope, dy / slope]
-S = np.stack(S); S = (S - S.mean((1, 2), keepdims=True)) / S.std((1, 2), keepdims=True)
-STATIC = torch.tensor(S[None], dtype=torch.float32, device=dev)
-GRID = GRID.to(dev)
+S = static_feats(st['dem'], a.static_plus)   # relieve a 3 km
 
 
 def t32(x): return torch.tensor(x, dtype=torch.float32, device=dev)
 
 
 def prep(C, t, B):
-    W = (windows(C, t, a.lags) - mu_x) / sd_x                                   # (n,L,17,13,C)
+    W = (windows(C, t, a.lags, a.init) - mu_x) / sd_x                           # (n,L,17,13,C)
     lo = t32(W).permute(0, 1, 4, 2, 3).flatten(1, 2)                             # (n,C*L,17,13): canal = lag*C + var
-    ang = 2 * np.pi * hour(t) / 24
-    hf = [np.sin(ang), np.cos(ang)] + (list(np.eye(24)[hour(t)].T) if a.hour_onehot else [])
-    hh = t32(np.stack(hf, 1))                                                    # (n,2 ó 26)
+    hh = t32(hour_feats(t, a.hour_onehot))                                       # (n,2 ó 26)
     hi = t32((B - mu_y) / sd_y).permute(0, 3, 1, 2)                              # base normalizada (n,4,70,35)
     return lo, hh, hi
-
-
-# ---------- modelo ----------
-def block(i, o):
-    layers = [nn.Conv2d(i, o, 3, padding=1), nn.GroupNorm(8, o), nn.GELU(),
-              nn.Conv2d(o, o, 3, padding=1), nn.GroupNorm(8, o), nn.GELU()]
-    return nn.Sequential(*layers, nn.Dropout2d(a.drop)) if a.drop else nn.Sequential(*layers)
-
-
-class UNet(nn.Module):
-    """Encoder a 27 km -> grid_sample a 3 km -> U-Net de 3 niveles con relieve y la base."""
-    def __init__(self, cin, nstatic, w):
-        super().__init__()
-        self.enc = nn.Sequential(nn.Conv2d(cin + NH, w, 3, padding=1), nn.GELU(), *[block(w, w) for _ in range(a.enc_blocks)])
-        self.static = nn.Parameter(torch.zeros(1, 8, 70, 35))
-        self.d1, self.d2, self.d3 = block(w + 4 + nstatic + 8 + NH, w), block(w, 2 * w), block(2 * w, 4 * w)
-        if a.attn:   # 18x9 = 162 tokens: contexto de todo el dominio para el viento
-            self.pos = nn.Parameter(torch.zeros(1, 18 * 9, 4 * w))
-            self.tf = nn.TransformerEncoderLayer(4 * w, 8, 8 * w, dropout=a.drop, batch_first=True, norm_first=True)
-        self.u2, self.u1 = block(6 * w, 2 * w), block(3 * w, w)
-        self.out = nn.Conv2d(w, 4, 1)
-
-    def forward(self, lo, hh, hi):
-        B = lo.shape[0]
-        H = hh[..., None, None]
-        f = self.enc(torch.cat([lo, H.expand(-1, -1, 17, 13)], 1))
-        f = F.grid_sample(f, GRID.expand(B, -1, -1, -1).to(f.dtype), align_corners=True)
-        x = torch.cat([f, hi, STATIC.expand(B, -1, -1, -1).to(f.dtype), self.static.expand(B, -1, -1, -1).to(f.dtype),
-                       H.expand(-1, -1, 70, 35).to(f.dtype)], 1)
-        e1 = self.d1(x)
-        e2 = self.d2(F.avg_pool2d(e1, 2, ceil_mode=True))
-        e3 = self.d3(F.avg_pool2d(e2, 2, ceil_mode=True))
-        if a.attn:
-            b, c, hgt, wid = e3.shape
-            e3 = self.tf(e3.flatten(2).transpose(1, 2) + self.pos).transpose(1, 2).reshape(b, c, hgt, wid)
-        up = lambda z, ref: F.interpolate(z, size=ref.shape[-2:], mode='bilinear', align_corners=False)
-        u2 = self.u2(torch.cat([up(e3, e2), e2], 1))
-        u1 = self.u1(torch.cat([up(u2, e1), e1], 1))
-        return self.out(u1).permute(0, 2, 3, 1)  # anomalía normalizada (B,70,35,4)
 
 
 LOtr, HHtr, HItr = prep(Ctr, ttr, Btr)
@@ -232,7 +142,7 @@ def score(P, Y):
 if val.any():
     print('base sola en val:', score(Btr[val], Ytr[val]))
 
-model = UNet(NC * NL, S.shape[0], a.width).to(dev)
+model = build(vars(a), st, S).to(dev)
 opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=a.wd)
 scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
 REF = t32(np.sqrt(((clim_trn[htr[trn]] - Ytr[trn]) ** 2).mean((0, 1, 2))))  # RMSE de la climatología en trn
@@ -299,11 +209,11 @@ if a.explain and val.any():
     imp['hora del día'] = drop(HH=HHv[perm])
     for j, v in enumerate(VARS):       # canal de la base a 3 km
         Hh = HIv.clone(); Hh[:, j] = HIv[perm][:, j]; imp[f'base {v}'] = drop(HI=Hh)
-    S0 = STATIC
+    S0 = model.S.clone()
     snames = ['altura', 'dx', 'dy', 'TPI9'] + (['TPI3', 'TPI21', 'pendiente', 'orient_x', 'orient_y'] if a.static_plus else [])
     for k, n in enumerate(snames):     # relieve: se anula el canal (ablación)
-        STATIC = S0.clone(); STATIC[:, k] = 0; imp[f'relieve {n}'] = drop()
-    STATIC = S0
+        model.S.copy_(S0); model.S[:, k] = 0; imp[f'relieve {n}'] = drop()
+    model.S.copy_(S0)
     row['importancia'] = dict(sorted(imp.items(), key=lambda kv: -kv[1]))
     # errores por píxel, por banda de altura y por hora
     err = (Pv - Ytr[val]) ** 2
