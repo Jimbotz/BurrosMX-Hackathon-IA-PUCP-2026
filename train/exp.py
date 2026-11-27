@@ -35,6 +35,7 @@ p.add_argument('--lr', type=float, default=2e-3)
 p.add_argument('--bs', type=int, default=32)
 p.add_argument('--wd', type=float, default=1e-4)
 p.add_argument('--loss', default='mse', choices=['mse', 'metric'])  # metric = promedio de RMSE_v / RMSE_clim_v, como Kaggle
+p.add_argument('--vw', type=float, nargs=4, default=[1, 1, 1, 1], help='peso de RH T U V en la pérdida (especialistas)')
 p.add_argument('--swa_from', type=int, default=0, help='promedia los pesos desde esta época (SWA); 0 = elegir la mejor época en val')
 p.add_argument('--amp', action='store_true', help='precisión mixta fp16 (solo CUDA)')
 p.add_argument('--seed', type=int, default=0)
@@ -226,9 +227,12 @@ scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
 REF = t32(np.sqrt(((clim_trn[htr[trn]] - Ytr[trn]) ** 2).mean((0, 1, 2))))  # RMSE de la climatología en trn
 
 
+VW = t32(np.array(a.vw) / np.mean(a.vw))
+
+
 def loss_fn(pred, y):
-    if a.loss == 'mse': return F.mse_loss(pred, y)
-    return (((pred - y) * SC).pow(2).mean((0, 1, 2)).add(1e-8).sqrt() / REF).mean()
+    if a.loss == 'mse': return ((pred - y).pow(2).mean((0, 1, 2)) * VW).mean()
+    return (((pred - y) * SC).pow(2).mean((0, 1, 2)).add(1e-8).sqrt() / REF * VW).mean()
 
 
 itr = np.where(trn)[0]
