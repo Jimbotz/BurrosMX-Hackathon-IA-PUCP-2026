@@ -1,0 +1,110 @@
+{
+ "full_a_recent30x3": [
+  0,
+  1,
+  2,
+  2
+ ],
+ "full_a_wind": [
+  0,
+  1,
+  0,
+  1
+ ],
+ "full_a_vap": [
+  0,
+  0,
+  1,
+  1
+ ],
+ "full_a_daily": [
+  1,
+  0,
+  1,
+  0
+ ],
+ "full_a_static": [
+  0,
+  1,
+  1,
+  0
+ ],
+ "full_a_enc2": [
+  0,
+  0,
+  1,
+  1
+ ],
+ "full_a_w96": [
+  0,
+  1,
+  1,
+  1
+ ],
+ "full_a_drop10": [
+  0,
+  0,
+  0,
+  1
+ ],
+ "full_b_b0_s1": [
+  0,
+  0,
+  0,
+  1
+ ],
+ "full_b_b1_viento": [
+  0,
+  0,
+  1,
+  0
+ ],
+ "full_b_b1_w128": [
+  1,
+  0,
+  1,
+  0
+ ],
+ "full_b_b1_suave": [
+  1,
+  1,
+  2,
+  2
+ ],
+ "full_c_w128_oh_init": [
+  1,
+  1,
+  0,
+  0
+ ],
+ "full_d_semana": [
+  1,
+  1,
+  1,
+  1
+ ],
+ "full_e_tattn_causal": [
+  0,
+  1,
+  1,
+  1
+ ],
+ "full_e_tattn_post": [
+  0,
+  0,
+  1,
+  0
+ ],
+ "full_e_xattn_post": [
+  0,
+  0,
+  0,
+  1
+ ],
+ "full_e_tattn_xattn": [
+  0,
+  0,
+  0,
+  1
+ ]
+}
