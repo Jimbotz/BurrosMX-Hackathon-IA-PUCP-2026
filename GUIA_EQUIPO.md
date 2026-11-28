@@ -222,7 +222,7 @@ Pasan a la final los 6 a 8 equipos con más puntaje. La final tiene su propia r�
 
 ## 9. Experimentos del modelo
 
-**El reporte completo está en [`docs/ANALISIS.md`](docs/ANALISIS.md)**: análisis de datos, todos los experimentos, el ensamble y la explicabilidad, con figuras en `docs/analisis/`.
+**Resultados de todos los modelos con todas las métricas: [`docs/RESULTADOS.md`](docs/RESULTADOS.md).** El reporte narrativo está en [`docs/ANALISIS.md`](docs/ANALISIS.md): análisis de datos, todos los experimentos, el ensamble y la explicabilidad, con figuras en `docs/analisis/`.
 
 **Estado actual:** ensamble de 18 redes con pesos por variable → **0.388** en validación cruzada temporal (starter: 0.338). La submission está generada (`train/runs/sub_ensamble_v2.csv`) y **todavía no se envió a Kaggle**.
 
